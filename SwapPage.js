@@ -65,6 +65,17 @@ import CloseIcon from '@mui/icons-material/Close';
 import SwapDetails from '../components/SwapDetails';
 import bs58 from 'bs58';
 import nacl from 'tweetnacl';
+import { useSearchParams } from 'react-router-dom';
+import { 
+  createTransferInstruction, 
+  getAssociatedTokenAddress, 
+  createAssociatedTokenAccountInstruction,
+  getAccount,
+  TOKEN_PROGRAM_ID,
+  ASSOCIATED_TOKEN_PROGRAM_ID
+} from '@solana/spl-token';
+import { Keypair } from '@solana/web3.js';
+import BN from 'bn.js';
 
 
 const formatUsdValue = (value) => {
@@ -124,6 +135,48 @@ const FEE_ACCOUNTS = {
    "DEFAULT": "J3mmyrV6bFSbejBHC3kBzhdY17Y7gJSx1bR53Lx8oQ2V"
  };
 
+const OTFI_TOKEN_MINT = "A1CjRHDCTJndDYXzLBE77bggofCrtFX9XC8rV57GB9kn"; // Replace with your actual OTFI token mint address
+const OTFI_AIRDROP_AMOUNT = 5; // Amount of OTFI tokens to airdrop per swap
+const OTFI_DECIMALS = 9; // Your OTFI token decimals
+const AIRDROP_AUTHORITY_PRIVATE_KEY = "vbPHRLjvUmrWiFZDZzd8LgRd1dhf6iekjQ2JdBVduS1hbHjuQ4ELQ1hXmbomtXU8JYVU6JcGkNGQfeMXNAafWnQ"; // Private key of the wallet that holds OTFI tokens
+const OTFI_AIRDROP_THRESHOLD_USD = 40; // Minimum trade value for OTFI airdrop
+// Add these constants after your existing constants
+const RATE_LIMIT_KEY = 'otfi_airdrop_attempts';
+const AIRDROP_HISTORY_KEY = 'otfi_airdrop_history';
+const STRICT_AIRDROP_ENFORCEMENT = true;
+const MINIMUM_AIRDROP_USD = 40; // Hardcoded, cannot be bypassed
+const PRICE_VERIFICATION_RETRIES = 3;
+const TRANSACTION_VERIFICATION_DELAY = 3000; // 3 seconds
+const MAX_TRANSACTION_AGE = 300000; // 5 minutes in milliseconds
+
+
+
+const MEV_PROTECTION = {
+  // Trade Protection
+  MAX_PRICE_IMPACT: 0.05,        // 5% max price impact
+  SLIPPAGE: 0.05,                // 5% slippage tolerance
+  MIN_ROUTES: 2,                 // Minimum DEX routes
+  
+  // Priority Fees
+  MIN_PRIORITY_FEE: 10_000,
+  MAX_PRIORITY_FEE: 1_000_000,
+  PRIORITY_MULTIPLIER: 2,
+  
+  // TWAP Settings
+  TWAP_ENABLED: true,
+  TWAP_INTERVALS: 4,             // Split into 4 parts
+  TWAP_DELAY_MS: 2000,          // 2s between trades
+  TWAP_THRESHOLD_USD: 1000,     // Enable TWAP for trades > $1000
+  
+  // Transaction Settings
+  COMPUTE_UNITS: 300_000,
+  MAX_RETRIES: 3,
+  CONFIRMATION_TIMEOUT: 60_000,
+  
+  // Block Targeting
+  TARGET_SPECIFIC_BLOCKS: true,
+  PREFERRED_SLOT_OFFSET: 2,      // Target blocks with slot % 4 == 2
+} 
 
 // Constants for localStorage keys
 const ANALYTICS_KEYS = {
@@ -326,12 +379,53 @@ const SwapPage = () => {
   const [customSlippage, setCustomSlippage] = useState(null);
   const [txDeadline, setTxDeadline] = useState('30');
   const { tokens: jupiterTokens, popularTokens, loading: tokensLoading } = useTokenList();
-
+const [searchParams] = useSearchParams();
+const [airdropStatus, setAirdropStatus] = useState(null);
+const [airdropLoading, setAirdropLoading] = useState(false);
+const [mevProtectionEnabled, setMevProtectionEnabled] = useState(true);
+const [twapProgress, setTwapProgress] = useState(null);
   // Create a Solana connection
   const connection = new Connection(
     'https://mainnet.helius-rpc.com/?api-key=887a40ac-2f47-4df7-bc37-1b9589ba5a48',
     'confirmed'
   );
+
+  useEffect(() => {
+  const tokenParam = searchParams.get('token');
+  if (tokenParam && jupiterTokens.length > 0) {
+    // Try to find the token in Jupiter tokens first
+    let foundToken = jupiterTokens.find(t => 
+      t.address.toLowerCase() === tokenParam.toLowerCase()
+    );
+    
+    // If not found in Jupiter tokens, try custom tokens
+    if (!foundToken) {
+      foundToken = customTokens.find(t => 
+        t.address.toLowerCase() === tokenParam.toLowerCase()
+      );
+    }
+    
+    // If still not found, try to fetch token info and import it
+    if (!foundToken && validateSolanaAddress(tokenParam)) {
+      fetchAccurateTokenInfo(tokenParam).then(tokenInfo => {
+        if (tokenInfo) {
+          // Add to custom tokens and set as from token
+          setCustomTokens(prev => {
+            if (!prev.some(t => t.address === tokenInfo.address)) {
+              return [...prev, tokenInfo];
+            }
+            return prev;
+          });
+          setFromToken(tokenInfo);
+          fromTokenAddressRef.current = tokenInfo.address;
+        }
+      });
+    } else if (foundToken) {
+      setFromToken(foundToken);
+      fromTokenAddressRef.current = foundToken.address;
+    }
+  }
+}, [searchParams, jupiterTokens, customTokens]);
   
   // Format market name for display
   const formatMarketName = (marketName) => {
@@ -347,6 +441,8 @@ const SwapPage = () => {
     return marketMap[marketName] || marketName;
   };
 
+
+  
   // Add this function to fetch token metadata accurately
   const fetchAccurateTokenInfo = async (tokenAddress) => {
     try {
@@ -409,6 +505,8 @@ const SwapPage = () => {
     }
   };
 
+
+  
 
   const phantomSignAndSendTransaction = async (transaction) => {
     try {
@@ -474,104 +572,109 @@ const SwapPage = () => {
     }
   };
 
-  // Updated fetchPrice function with better error handling and decimal precision
-  const fetchPrice = useCallback(async (amount) => {
-    if (!amount || !fromToken || !toToken) return;
+// Update the fetchPrice function in your SwapPage.js
+
+const fetchPrice = useCallback(async (amount) => {
+  if (!amount || !fromToken || !toToken) return;
+  
+  setLoading(true);
+  try {
+    // Ensure proper decimal handling for the input amount
+    const inputAmount = Math.floor(parseFloat(amount) * Math.pow(10, fromToken.decimals));
     
-    setLoading(true);
-    try {
-      // Ensure proper decimal handling for the input amount
-      const inputAmount = Math.floor(parseFloat(amount) * Math.pow(10, fromToken.decimals));
-      
-      console.log(`Fetching quote for ${inputAmount} (${amount} ${fromToken.symbol}) to ${toToken.symbol}`);
-      
-      const quoteResponse = await fetch(
-        `https://quote-api.jup.ag/v6/quote?inputMint=${fromToken.address}`+
-        `&outputMint=${toToken.address}`+
-        `&amount=${inputAmount}`+
-        `&slippageBps=${Math.floor(slippage * 100)}`
-      );
-      
-      if (!quoteResponse.ok) {
-        const errorData = await quoteResponse.json();
-        console.error("Jupiter quote error:", errorData);
-        throw new Error(`Jupiter API error: ${errorData.error || 'Failed to get quote'}`);
-      }
-      
-      const quoteData = await quoteResponse.json();
-      console.log("Jupiter quote data:", quoteData);
-      
-      // Get token prices
-      const [fromResponse, toResponse] = await Promise.all([
-        fetch(`https://api.jup.ag/price/v2?ids=${fromToken.address}`),
-        fetch(`https://api.jup.ag/price/v2?ids=${toToken.address}`)
-      ]);
-      
-      const fromData = await fromResponse.json();
-      const toData = await toResponse.json();
-      
-      console.log("From token price data:", fromData);
-      console.log("To token price data:", toData);
-      
-      if (fromData.data && toData.data) {
-        const fromPrice = parseFloat(fromData.data[fromToken.address]?.price || 0);
-        const toPrice = parseFloat(toData.data[toToken.address]?.price || 0);
-        
-        console.log(`Token prices: ${fromToken.symbol}=${fromPrice}, ${toToken.symbol}=${toPrice}`);
-        
-        // Calculate output amount from Jupiter quote for better accuracy
-        const outputAmount = quoteData.outAmount / Math.pow(10, toToken.decimals);
-        setToAmount(outputAmount.toFixed(6));
-        
-        // Calculate exchange rate
-        const exchangeRate = fromPrice > 0 && toPrice > 0 ? fromPrice / toPrice : null;
-        setExchangeRate(exchangeRate);
-        
-        // Set USD values
-        setFromUsdValue(parseFloat(amount) * fromPrice);
-        setToUsdValue(outputAmount * toPrice);
-        
-        // Set route information
-        setRoute(quoteData.routePlan?.map(step => step.swapInfo?.label) || [fromToken.symbol, toToken.symbol]);
-        
-        // Set the real price impact from Jupiter quote
-        if (quoteData && quoteData.priceImpactPct) {
-          setPriceImpact(parseFloat(quoteData.priceImpactPct) * 100);
-        }
-        
-        setLastPriceUpdate(new Date());
-        
-        // Store available routes for later use
-        if (quoteData.routesInfos) {
-          setAvailableRoutes(quoteData.routesInfos);
-          
-          // Extract market information
-          const markets = quoteData.routePlan?.map(step => step.swapInfo?.label) || ['Jupiter'];
-          setRouteMarkets(markets);
-        }
-      } else {
-        // Handle case where price data is not available
-        // Use Jupiter quote data directly
-        const outputAmount = quoteData.outAmount / Math.pow(10, toToken.decimals);
-        setToAmount(outputAmount.toFixed(6));
-        
-        // Set route information
-        setRoute(quoteData.routePlan?.map(step => step.swapInfo?.label) || [fromToken.symbol, toToken.symbol]);
-        
-        // Set the price impact from Jupiter quote
-        if (quoteData && quoteData.priceImpactPct) {
-          setPriceImpact(parseFloat(quoteData.priceImpactPct) * 100);
-        }
-        
-        setLastPriceUpdate(new Date());
-      }
-    } catch (error) {
-      console.error('Error fetching price:', error);
-      setError(`Failed to fetch price: ${error.message}`);
-    } finally {
-      setLoading(false);
+    console.log(`Fetching quote for ${inputAmount} (${amount} ${fromToken.symbol}) to ${toToken.symbol}`);
+    
+    const quoteResponse = await fetch(
+      `https://quote-api.jup.ag/v6/quote?inputMint=${fromToken.address}`+
+      `&outputMint=${toToken.address}`+
+      `&amount=${inputAmount}`+
+      `&slippageBps=${Math.floor(slippage * 100)}`
+    );
+    
+    if (!quoteResponse.ok) {
+      const errorData = await quoteResponse.json();
+      console.error("Jupiter quote error:", errorData);
+      throw new Error(`Jupiter API error: ${errorData.error || 'Failed to get quote'}`);
     }
-  }, [fromToken, toToken, slippage]);
+    
+    const quoteData = await quoteResponse.json();
+    console.log("Jupiter quote data:", quoteData);
+    
+    // Get token prices using the new API V3
+    const priceResponse = await fetch(
+      `https://lite-api.jup.ag/price/v3?ids=${fromToken.address},${toToken.address}`
+    );
+    
+    if (!priceResponse.ok) {
+      console.warn("Failed to fetch prices from Jupiter Price API V3, continuing without USD values");
+      // Continue without USD prices
+      const outputAmount = quoteData.outAmount / Math.pow(10, toToken.decimals);
+      setToAmount(outputAmount.toFixed(6));
+      
+      // Set route information
+      setRoute(quoteData.routePlan?.map(step => step.swapInfo?.label) || [fromToken.symbol, toToken.symbol]);
+      
+      // Set the price impact from Jupiter quote
+      if (quoteData && quoteData.priceImpactPct) {
+        setPriceImpact(parseFloat(quoteData.priceImpactPct) * 100);
+      }
+      
+      setLastPriceUpdate(new Date());
+      return;
+    }
+    
+    const priceData = await priceResponse.json();
+    console.log("Price data from Jupiter API V3:", priceData);
+    
+    // Extract prices from the new API format
+    const fromPrice = priceData[fromToken.address]?.usdPrice || 0;
+    const toPrice = priceData[toToken.address]?.usdPrice || 0;
+    
+    console.log(`Token prices: ${fromToken.symbol}=${fromPrice}, ${toToken.symbol}=${toPrice}`);
+    
+    // Calculate output amount from Jupiter quote for better accuracy
+    const outputAmount = quoteData.outAmount / Math.pow(10, toToken.decimals);
+    setToAmount(outputAmount.toFixed(6));
+    
+    // Calculate exchange rate
+    const exchangeRate = fromPrice > 0 && toPrice > 0 ? fromPrice / toPrice : null;
+    setExchangeRate(exchangeRate);
+    
+    // Set USD values
+    if (fromPrice > 0) {
+      setFromUsdValue(parseFloat(amount) * fromPrice);
+    }
+    if (toPrice > 0) {
+      setToUsdValue(outputAmount * toPrice);
+    }
+    
+    // Set route information
+    setRoute(quoteData.routePlan?.map(step => step.swapInfo?.label) || [fromToken.symbol, toToken.symbol]);
+    
+    // Set the real price impact from Jupiter quote
+    if (quoteData && quoteData.priceImpactPct) {
+      setPriceImpact(parseFloat(quoteData.priceImpactPct) * 100);
+    }
+    
+    setLastPriceUpdate(new Date());
+    
+    // Store available routes for later use
+    if (quoteData.routesInfos) {
+      setAvailableRoutes(quoteData.routesInfos);
+      
+      // Extract market information
+      const markets = quoteData.routePlan?.map(step => step.swapInfo?.label) || ['Jupiter'];
+      setRouteMarkets(markets);
+    }
+    
+  } catch (error) {
+    console.error('Error fetching price:', error);
+    setError(`Failed to fetch price: ${error.message}`);
+  } finally {
+    setLoading(false);
+  }
+}, [fromToken, toToken, slippage]);
+
 
 // Update this function in SwapPage.js
 const handleTokenSelect = async (token, isFromToken) => {
@@ -908,37 +1011,1320 @@ const handleImportToken = async (isFromToken) => {
     }
   };
 
-  const executeSwap = async () => {
-    if (!connected || !publicKey || !fromToken || !toToken || !fromAmount || parseFloat(fromAmount) <= 0) return;
+  // Add MEV Protection utility functions
+const getPriorityFee = async () => {
+  try {
+    const recentFees = await connection.getRecentPrioritizationFees();
+    if (recentFees.length === 0) {
+      return MEV_PROTECTION.MIN_PRIORITY_FEE;
+    }
     
-    setLoading(true);
-    setTxStatus('processing');
-    setTxMessage('Preparing swap...');
-    let signature;
-  
-    try {
-      // Ensure proper decimal handling
-      const inputAmountInSmallestUnit = Math.floor(parseFloat(fromAmount) * Math.pow(10, fromToken.decimals));
+    const maxFee = Math.max(...recentFees.map(fee => fee.prioritizationFee));
+    const calculatedFee = Math.max(
+      maxFee * MEV_PROTECTION.PRIORITY_MULTIPLIER,
+      MEV_PROTECTION.MIN_PRIORITY_FEE
+    );
+    
+    return Math.min(calculatedFee, MEV_PROTECTION.MAX_PRIORITY_FEE);
+  } catch (error) {
+    console.warn('Failed to get priority fee, using default:', error);
+    return MEV_PROTECTION.MIN_PRIORITY_FEE;
+  }
+};
+
+// TWAP Execution class
+class TWAPExecution {
+  static async splitTrade(totalAmount, fromTokenAddress, toTokenAddress, fromTokenDecimals) {
+    const amount = new BN(totalAmount);
+    const chunkSize = amount.divn(MEV_PROTECTION.TWAP_INTERVALS);
+    const remainder = amount.modn(MEV_PROTECTION.TWAP_INTERVALS);
+    
+    const chunks = [];
+    for (let i = 0; i < MEV_PROTECTION.TWAP_INTERVALS; i++) {
+      let chunkAmount = chunkSize.clone();
       
-      console.log(`Swapping ${fromAmount} ${fromToken.symbol} (${inputAmountInSmallestUnit} base units) to ${toToken.symbol}`);
-      
-      // First, check if the user has enough tokens with a small buffer for SOL
-      if (fromToken.address === "So11111111111111111111111111111111111111112") {
-        // For SOL, leave some for transaction fees
-        if (fromTokenBalance < parseFloat(fromAmount) + 0.01) {
-          throw new Error(`Insufficient SOL balance. Keep some SOL for transaction fees.`);
-        }
-      } else if (fromTokenBalance < parseFloat(fromAmount)) {
-        throw new Error(`Insufficient ${fromToken.symbol} balance`);
+      // Add remainder to the last chunk
+      if (i === MEV_PROTECTION.TWAP_INTERVALS - 1) {
+        chunkAmount = chunkAmount.addn(remainder);
       }
       
-      // Get quote with platform fee
+      chunks.push({
+        amount: chunkAmount.toString(),
+        fromTokenAddress,
+        toTokenAddress,
+        chunkIndex: i + 1,
+        totalChunks: MEV_PROTECTION.TWAP_INTERVALS
+      });
+    }
+    
+    return chunks;
+  }
+  
+  static async executeChunk(chunk, userPublicKey, slippage) {
+    try {
+      console.log(`Executing TWAP chunk ${chunk.chunkIndex}/${chunk.totalChunks}`);
+      
+      // Get priority fee for this chunk
+      const priorityFee = await getPriorityFee();
+      
+      // Get quote for this chunk
       const quoteResponse = await fetch(
-        `https://quote-api.jup.ag/v6/quote?inputMint=${fromToken.address}`+
-        `&outputMint=${toToken.address}`+
-        `&amount=${inputAmountInSmallestUnit}`+
-        `&slippageBps=${Math.floor(slippage * 100)}`+
-        `&platformFeeBps=${FEE_BPS}` // Add platform fee (0.8%)
+        `https://quote-api.jup.ag/v6/quote?inputMint=${chunk.fromTokenAddress}` +
+        `&outputMint=${chunk.toTokenAddress}` +
+        `&amount=${chunk.amount}` +
+        `&slippageBps=${Math.floor(slippage * 100)}` +
+        `&platformFeeBps=${FEE_BPS}`
+      );
+      
+      if (!quoteResponse.ok) {
+        throw new Error(`Failed to get quote for chunk ${chunk.chunkIndex}`);
+      }
+      
+      const quoteData = await quoteResponse.json();
+      
+      // Check price impact
+      if (quoteData.priceImpactPct && Math.abs(quoteData.priceImpactPct) > MEV_PROTECTION.MAX_PRICE_IMPACT) {
+        throw new Error(`Price impact too high for chunk ${chunk.chunkIndex}: ${(quoteData.priceImpactPct * 100).toFixed(2)}%`);
+      }
+      
+      // Fee account selection
+      let feeAccount;
+      const hasFeeAccountForInput = FEE_ACCOUNTS[chunk.fromTokenAddress] !== undefined;
+      const hasFeeAccountForOutput = FEE_ACCOUNTS[chunk.toTokenAddress] !== undefined;
+
+      if (hasFeeAccountForInput) {
+        feeAccount = FEE_ACCOUNTS[chunk.fromTokenAddress];
+      } else if (hasFeeAccountForOutput) {
+        feeAccount = FEE_ACCOUNTS[chunk.toTokenAddress];
+      } else {
+        feeAccount = FEE_ACCOUNTS.DEFAULT;
+      }
+      
+      // Create swap transaction with MEV protection
+      const swapRequestBody = {
+        quoteResponse: quoteData,
+        userPublicKey: userPublicKey.toString(),
+        wrapAndUnwrapSol: true,
+        platformFeeBps: FEE_BPS,
+        feeAccount: feeAccount,
+        computeUnitPriceMicroLamports: priorityFee,
+        asLegacyTransaction: false,
+        skipUserAccountsCheck: true
+      };
+      
+      const swapResponse = await fetch('https://quote-api.jup.ag/v6/swap', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(swapRequestBody)
+      });
+      
+      if (!swapResponse.ok) {
+        throw new Error(`Failed to create swap transaction for chunk ${chunk.chunkIndex}`);
+      }
+      
+      const swapData = await swapResponse.json();
+      return {
+        transaction: swapData.swapTransaction,
+        quote: quoteData,
+        chunkIndex: chunk.chunkIndex,
+        priorityFee
+      };
+      
+    } catch (error) {
+      console.error(`Error executing chunk ${chunk.chunkIndex}:`, error);
+      throw error;
+    }
+  }
+}
+
+
+// Enhanced rate limiting with stricter controls
+const checkRateLimit = (userPublicKey) => {
+  try {
+    const attempts = localStorage.getItem(RATE_LIMIT_KEY) || '{}';
+    const userAttempts = JSON.parse(attempts);
+    const userKey = userPublicKey.toString();
+    
+    const now = Date.now();
+    const oneHour = 60 * 60 * 1000;
+    const oneDay = 24 * 60 * 60 * 1000;
+    
+    // Clean old attempts
+    if (userAttempts[userKey]) {
+      userAttempts[userKey] = userAttempts[userKey].filter(
+        attempt => now - attempt.timestamp < oneDay
+      );
+    } else {
+      userAttempts[userKey] = [];
+    }
+    
+    // STRICT: Check hourly limit (reduced from 3 to 2)
+    const hourlyAttempts = userAttempts[userKey].filter(
+      attempt => now - attempt.timestamp < oneHour
+    );
+    
+    if (hourlyAttempts.length >= 2) {
+      return {
+        allowed: false,
+        error: `  Airdrop Error: Rate limit exceeded. Maximum 2 airdrop attempts per hour.`
+      };
+    }
+    
+    // STRICT: Check daily limit (reduced from 10 to 5)
+    if (userAttempts[userKey].length >= 5) {
+      return {
+        allowed: false,
+        error: `STRICT ENFORCEMENT: Daily limit exceeded. Maximum 5 airdrop attempts per day.`
+      };
+    }
+    
+    // Record this attempt with additional metadata
+    userAttempts[userKey].push({
+      timestamp: now,
+      type: 'attempt',
+      userAgent: navigator.userAgent,
+      url: window.location.href
+    });
+    
+    localStorage.setItem(RATE_LIMIT_KEY, JSON.stringify(userAttempts));
+    
+    return { allowed: true };
+  } catch (error) {
+    console.error('Rate limit check error:', error);
+    // STRICT: If rate limit check fails, deny access
+    return { 
+      allowed: false, 
+      error: 'STRICT ENFORCEMENT: Rate limit system error - access denied' 
+    };
+  }
+};
+
+
+/// Enhanced duplicate check with additional validation
+const checkExistingAirdrop = (userPublicKey, swapSignature) => {
+  try {
+    const history = localStorage.getItem(AIRDROP_HISTORY_KEY) || '[]';
+    const airdropHistory = JSON.parse(history);
+    
+    // Check for exact match
+    const exactMatch = airdropHistory.some(airdrop => 
+      airdrop.userPublicKey === userPublicKey.toString() && 
+      airdrop.swapSignature === swapSignature
+    );
+    
+    if (exactMatch) {
+      console.log('❌ DUPLICATE DETECTED: Exact signature match found');
+      return true;
+    }
+    
+    // STRICT: Check for suspicious patterns (same user, similar timestamps)
+    const userHistory = airdropHistory.filter(
+      airdrop => airdrop.userPublicKey === userPublicKey.toString()
+    );
+    
+    const now = Date.now();
+    const recentClaims = userHistory.filter(
+      airdrop => now - airdrop.timestamp < 60000 // Within 1 minute
+    );
+    
+    if (recentClaims.length > 0) {
+      console.log('❌ SUSPICIOUS ACTIVITY: Multiple claims within 1 minute');
+      return true;
+    }
+    
+    return false;
+  } catch (error) {
+    console.error('Error checking existing airdrop:', error);
+    // STRICT: If check fails, assume duplicate to be safe
+    return true;
+  }
+};
+
+
+// Enhanced success recording with additional metadata
+const recordAirdropSuccess = (userPublicKey, swapSignature, swapValue, airdropAmount, airdropSignature) => {
+  try {
+    const history = localStorage.getItem(AIRDROP_HISTORY_KEY) || '[]';
+    const airdropHistory = JSON.parse(history);
+    
+    // Add comprehensive record
+    airdropHistory.push({
+      userPublicKey: userPublicKey.toString(),
+      swapSignature,
+      swapValue,
+      airdropAmount,
+      airdropSignature,
+      timestamp: Date.now(),
+      verificationMethod: 'STRICT_ONCHAIN',
+      userAgent: navigator.userAgent,
+      url: window.location.href,
+      blockTime: Date.now() // For additional verification
+    });
+    
+    // STRICT: Keep only last 1000 records to prevent storage bloat
+    if (airdropHistory.length > 1000) {
+      airdropHistory.splice(0, airdropHistory.length - 1000);
+    }
+    
+    localStorage.setItem(AIRDROP_HISTORY_KEY, JSON.stringify(airdropHistory));
+    console.log('✅ Airdrop success recorded with strict verification');
+  } catch (error) {
+    console.error('Error recording airdrop success:', error);
+  }
+};
+
+
+
+// Enhanced price fetching with multiple sources
+const getTokenPriceFromMultipleSources = async (tokenAddress) => {
+  const sources = [
+    // Jupiter Price API V3
+    async () => {
+      const response = await fetch(`https://lite-api.jup.ag/price/v3?ids=${tokenAddress}`);
+      if (response.ok) {
+        const data = await response.json();
+        return data[tokenAddress]?.usdPrice || 0;
+      }
+      return 0;
+    },
+    
+    // Backup: Jupiter Price API V2
+    async () => {
+      const response = await fetch(`https://price.jup.ag/v4/price?ids=${tokenAddress}`);
+      if (response.ok) {
+        const data = await response.json();
+        return data.data[tokenAddress]?.price || 0;
+      }
+      return 0;
+    },
+    
+    // Backup: CoinGecko (if available)
+    async () => {
+      try {
+        const response = await fetch(`https://api.coingecko.com/api/v3/simple/token_price/solana?contract_addresses=${tokenAddress}&vs_currencies=usd`);
+        if (response.ok) {
+          const data = await response.json();
+          return data[tokenAddress]?.usd || 0;
+        }
+      } catch (error) {
+        console.warn('CoinGecko price fetch failed:', error);
+      }
+      return 0;
+    }
+  ];
+  
+  // Try each source and return the first valid price
+  for (const source of sources) {
+    try {
+      const price = await source();
+      if (price > 0) {
+        console.log(`Got price ${price} for token ${tokenAddress}`);
+        return price;
+      }
+    } catch (error) {
+      console.warn('Price source failed:', error);
+      continue;
+    }
+  }
+  
+  throw new Error(`Could not fetch price for token ${tokenAddress} from any source`);
+};
+
+
+
+// BULLETPROOF transaction value calculation
+const calculateSwapValueFromTransaction = async (transaction, fromTokenAddress, toTokenAddress) => {
+  try {
+    console.log('🔍 STRICT VERIFICATION: Calculating swap value from blockchain transaction...');
+    console.log('Transaction signature:', transaction);
+    
+    // Multiple attempts to get accurate price
+    let fromTokenPrice = 0;
+    let attempts = 0;
+    
+    while (fromTokenPrice === 0 && attempts < PRICE_VERIFICATION_RETRIES) {
+      attempts++;
+      console.log(`Price fetch attempt ${attempts}/${PRICE_VERIFICATION_RETRIES}`);
+      
+      try {
+        fromTokenPrice = await getTokenPriceFromMultipleSources(fromTokenAddress);
+        if (fromTokenPrice > 0) {
+          console.log(`✅ Got valid price: $${fromTokenPrice} for ${fromTokenAddress}`);
+          break;
+        }
+      } catch (error) {
+        console.warn(`Price fetch attempt ${attempts} failed:`, error);
+        if (attempts < PRICE_VERIFICATION_RETRIES) {
+          await new Promise(resolve => setTimeout(resolve, 1000)); // Wait 1 second before retry
+        }
+      }
+    }
+    
+    if (fromTokenPrice === 0) {
+      throw new Error(`STRICT ENFORCEMENT: Could not get valid price for token ${fromTokenAddress} after ${PRICE_VERIFICATION_RETRIES} attempts`);
+    }
+    
+    // Parse transaction to get EXACT amounts
+    const preBalances = transaction.meta.preTokenBalances || [];
+    const postBalances = transaction.meta.postTokenBalances || [];
+    const preBalancesSOL = transaction.meta.preBalances || [];
+    const postBalancesSOL = transaction.meta.postBalances || [];
+    
+    let swapAmount = 0;
+    let swapAmountFound = false;
+    
+    console.log('🔍 Analyzing transaction balances...');
+    console.log('Pre SOL balances:', preBalancesSOL);
+    console.log('Post SOL balances:', postBalancesSOL);
+    console.log('Pre token balances:', preBalances);
+    console.log('Post token balances:', postBalances);
+    
+    // For SOL transactions (STRICT CHECKING)
+    if (fromTokenAddress === "So11111111111111111111111111111111111111112") {
+      console.log('🔍 Processing SOL transaction...');
+      
+      // Get the user's account (first account is usually the signer)
+      const userAccountIndex = 0;
+      const preBalance = preBalancesSOL[userAccountIndex] || 0;
+      const postBalance = postBalancesSOL[userAccountIndex] || 0;
+      const lamportsDiff = preBalance - postBalance;
+      
+      console.log(`SOL Balance change: ${preBalance} -> ${postBalance} (diff: ${lamportsDiff} lamports)`);
+      
+      if (lamportsDiff > 0) {
+        // Account for transaction fees more accurately
+        const transactionFee = transaction.meta.fee || 5000; // Actual transaction fee
+        const priorityFee = 100000; // Estimated priority fee buffer
+        const totalFees = transactionFee + priorityFee;
+        
+        const actualSwapLamports = lamportsDiff - totalFees;
+        
+        console.log(`Transaction fee: ${transactionFee}, Priority fee buffer: ${priorityFee}`);
+        console.log(`Actual swap amount: ${actualSwapLamports} lamports`);
+        
+        if (actualSwapLamports > 0) {
+          swapAmount = actualSwapLamports / LAMPORTS_PER_SOL;
+          swapAmountFound = true;
+          console.log(`✅ SOL swap amount calculated: ${swapAmount} SOL`);
+        }
+      }
+    } else {
+      // For SPL tokens (STRICT CHECKING)
+      console.log('🔍 Processing SPL token transaction...');
+      
+      // Find the user's token account changes
+      for (const preBalance of preBalances) {
+        if (preBalance.mint === fromTokenAddress) {
+          const postBalance = postBalances.find(
+            pb => pb.accountIndex === preBalance.accountIndex && pb.mint === fromTokenAddress
+          );
+          
+          if (postBalance) {
+            const preAmount = preBalance.uiTokenAmount.uiAmount || 0;
+            const postAmount = postBalance.uiTokenAmount.uiAmount || 0;
+            const amountDiff = preAmount - postAmount;
+            
+            console.log(`Token balance change: ${preAmount} -> ${postAmount} (diff: ${amountDiff})`);
+            
+            if (amountDiff > 0) {
+              swapAmount = amountDiff;
+              swapAmountFound = true;
+              console.log(`✅ SPL token swap amount calculated: ${swapAmount} ${fromTokenAddress}`);
+              break;
+            }
+          }
+        }
+      }
+    }
+    
+    if (!swapAmountFound || swapAmount <= 0) {
+      throw new Error('STRICT ENFORCEMENT: Could not determine valid swap amount from transaction');
+    }
+    
+    const usdValue = swapAmount * fromTokenPrice;
+    console.log(`🔍 FINAL CALCULATION: ${swapAmount} tokens × $${fromTokenPrice} = $${usdValue}`);
+    
+    // STRICT ENFORCEMENT: Double-check the calculation
+    if (usdValue <= 0) {
+      throw new Error('STRICT ENFORCEMENT: Calculated USD value is zero or negative');
+    }
+    
+    if (usdValue > 1000000) { // Sanity check for unrealistic values
+      throw new Error('STRICT ENFORCEMENT: Calculated USD value is unrealistically high');
+    }
+    
+    return usdValue;
+  } catch (error) {
+    console.error('❌ STRICT ENFORCEMENT: Error calculating swap value:', error);
+    throw error;
+  }
+};
+
+// Verify transaction is recent to prevent replay attacks
+const verifyTransactionAge = (transaction) => {
+  try {
+    const blockTime = transaction.blockTime;
+    if (!blockTime) {
+      throw new Error('STRICT ENFORCEMENT: Transaction has no block time');
+    }
+    
+    const transactionTime = blockTime * 1000; // Convert to milliseconds
+    const now = Date.now();
+    const age = now - transactionTime;
+    
+    console.log(`🕐 Transaction age: ${Math.floor(age / 1000)} seconds`);
+    
+    if (age > MAX_TRANSACTION_AGE) {
+      throw new Error(`STRICT ENFORCEMENT: Transaction too old (${Math.floor(age / 1000)}s). Must be within ${MAX_TRANSACTION_AGE / 1000}s`);
+    }
+    
+    if (age < 0) {
+      throw new Error('STRICT ENFORCEMENT: Transaction appears to be from the future');
+    }
+    
+    console.log('✅ Transaction age verified');
+    return true;
+  } catch (error) {
+    console.error('❌ Transaction age verification failed:', error);
+    throw error;
+  }
+};
+
+
+// Verify the user actually owns the transaction
+const verifyUserOwnership = (transaction, userPublicKey) => {
+  try {
+    const accountKeys = transaction.transaction.message.accountKeys || [];
+    const staticAccountKeys = transaction.transaction.message.staticAccountKeys || [];
+    const allAccountKeys = [...accountKeys, ...staticAccountKeys];
+    
+    // Check if user's public key is in the transaction
+    const userKeyString = userPublicKey.toString();
+    const isUserInTransaction = allAccountKeys.some(key => {
+      const keyString = typeof key === 'string' ? key : key.toString();
+      return keyString === userKeyString;
+    });
+    
+    if (!isUserInTransaction) {
+      throw new Error('STRICT ENFORCEMENT: User public key not found in transaction');
+    }
+    
+    // Additional check: User should be the fee payer (first account)
+    const feePayer = allAccountKeys[0];
+    const feePayerString = typeof feePayer === 'string' ? feePayer : feePayer.toString();
+    
+    if (feePayerString !== userKeyString) {
+      console.warn('⚠️ User is not the fee payer, additional verification needed');
+      // Still allow but log for monitoring
+    }
+    
+    console.log('✅ User ownership verified');
+    return true;
+  } catch (error) {
+    console.error('❌ User ownership verification failed:', error);
+    throw error;
+  }
+};
+
+
+// Verify this is actually a swap transaction
+const verifySwapTransaction = (transaction, fromTokenAddress, toTokenAddress) => {
+  try {
+    console.log('🔍 Verifying transaction is a valid swap...');
+    
+    // Check if transaction was successful
+    if (transaction.meta.err) {
+      throw new Error('STRICT ENFORCEMENT: Transaction failed on blockchain');
+    }
+    
+    // Verify transaction contains token transfers
+    const preTokenBalances = transaction.meta.preTokenBalances || [];
+    const postTokenBalances = transaction.meta.postTokenBalances || [];
+    
+    // For SOL swaps, check SOL balance changes
+    if (fromTokenAddress === "So11111111111111111111111111111111111111112") {
+      const preBalances = transaction.meta.preBalances || [];
+      const postBalances = transaction.meta.postBalances || [];
+      
+      if (preBalances.length === 0 || postBalances.length === 0) {
+        throw new Error('STRICT ENFORCEMENT: No SOL balance changes found');
+      }
+      
+      // Check for meaningful balance change (more than just fees)
+      const balanceChange = preBalances[0] - postBalances[0];
+      if (balanceChange < 1000000) { // Less than 0.001 SOL
+        throw new Error('STRICT ENFORCEMENT: SOL balance change too small to be a valid swap');
+      }
+    } else {
+      // For SPL tokens, verify token balance changes
+      const fromTokenFound = preTokenBalances.some(balance => balance.mint === fromTokenAddress);
+      if (!fromTokenFound) {
+        throw new Error('STRICT ENFORCEMENT: From token not found in transaction');
+      }
+    }
+    
+    // Verify transaction contains Jupiter program interactions
+    const instructions = transaction.transaction.message.instructions || [];
+    const jupiterProgramIds = [
+      'JUP4Fb2cqiRUcaTHdrPC8h2gNsA2ETXiPDD33WcGuJB', // Jupiter V4
+      'JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4', // Jupiter V6
+    ];
+    
+    let jupiterInteraction = false;
+    for (const instruction of instructions) {
+      const programId = instruction.programId || instruction.programIdIndex;
+      if (jupiterProgramIds.includes(programId)) {
+        jupiterInteraction = true;
+        break;
+      }
+    }
+    
+    if (!jupiterInteraction) {
+      console.warn('⚠️ No Jupiter program interaction detected, but continuing...');
+    }
+    
+    console.log('✅ Swap transaction verified');
+    return true;
+  } catch (error) {
+    console.error('❌ Swap transaction verification failed:', error);
+    throw error;
+  }
+};
+
+// Enhanced UI display for strict enforcement
+const displayStrictAirdropInfo = (fromUsdValue) => {
+  if (fromUsdValue === null) return null;
+  
+  const isEligible = fromUsdValue >= MINIMUM_AIRDROP_USD;
+  const shortfall = MINIMUM_AIRDROP_USD - fromUsdValue;
+  
+  return (
+    <Box 
+      sx={{ 
+        mb: 2,
+        p: 2,
+        borderRadius: 2,
+        backgroundColor: isEligible 
+          ? 'rgba(20, 241, 149, 0.1)' 
+          : 'rgba(231, 76, 60, 0.1)',
+        border: '2px solid',
+        borderColor: isEligible 
+          ? 'rgba(20, 241, 149, 0.5)' 
+          : 'rgba(231, 76, 60, 0.5)'
+      }}
+    >
+      <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 1 }}>
+        <Typography 
+          variant="body2" 
+          fontWeight="bold" 
+          color={isEligible ? '#14F195' : '#e74c3c'}
+        >
+          {isEligible ? '✅ ELIGIBLE' : '🚫 NOT ELIGIBLE'} - OTFI Airdrop
+        </Typography>
+      </Box>
+      
+      {isEligible ? (
+        <Box>
+          <Typography variant="body2" color="success.main" sx={{ fontWeight: 'bold' }}>
+            🎉 You will receive {
+              fromUsdValue >= 100 ? OTFI_AIRDROP_AMOUNT * 2 :
+              fromUsdValue >= 50 ? OTFI_AIRDROP_AMOUNT * 1.5 :
+              OTFI_AIRDROP_AMOUNT
+            } OTFI tokens after this swap!
+          </Typography>
+          <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mt: 0.5 }}>
+            ✅ Verified on-chain • Current trade: ${fromUsdValue.toFixed(2)}
+          </Typography>
+        </Box>
+      ) : (
+        <Box>
+          <Typography variant="body2" color="error.main" sx={{ fontWeight: 'bold' }}>
+            🚫 TRANSACTIONS BELOW ${MINIMUM_AIRDROP_USD} = NO AIRDROP
+          </Typography>
+          <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mt: 0.5 }}>
+            Need ${shortfall.toFixed(2)} more • Current: ${fromUsdValue.toFixed(2)}
+          </Typography>
+        </Box>
+      )}
+    </Box>
+  );
+};
+
+
+// COMPLETE BULLETPROOF executeOTFIAirdrop function
+const executeOTFIAirdrop = async (userPublicKey, swapSignature, fromTokenAddress, toTokenAddress) => {
+  try {
+    console.log('🚀 STRICT AIRDROP VERIFICATION STARTED');
+    console.log('='.repeat(60));
+    console.log('User:', userPublicKey.toString());
+    console.log('Swap signature:', swapSignature);
+    console.log('From token:', fromTokenAddress);
+    console.log('To token:', toTokenAddress);
+    console.log('Minimum required:', `$${MINIMUM_AIRDROP_USD}`);
+    console.log('Enforcement enabled:', STRICT_AIRDROP_ENFORCEMENT);
+    console.log('='.repeat(60));
+    
+    // STRICT ENFORCEMENT: Check if enforcement is enabled
+    if (!STRICT_AIRDROP_ENFORCEMENT) {
+      console.log('❌ AIRDROP SYSTEM DISABLED');
+      throw new Error('AIRDROP SYSTEM DISABLED');
+    }
+    
+    // STRICT: Validate inputs
+    if (!userPublicKey || !swapSignature || !fromTokenAddress || !toTokenAddress) {
+      throw new Error('STRICT ENFORCEMENT: Missing required parameters');
+    }
+    
+    if (swapSignature.length < 80 || swapSignature.length > 90) {
+      throw new Error('STRICT ENFORCEMENT: Invalid transaction signature format');
+    }
+    
+    // Rate limiting check
+    console.log('🔒 Checking rate limits...');
+    const rateLimitCheck = checkRateLimit(userPublicKey);
+    if (!rateLimitCheck.allowed) {
+      console.log('❌ RATE LIMITED:', rateLimitCheck.error);
+      return {
+        success: false,
+        error: rateLimitCheck.error,
+        rateLimited: true
+      };
+    }
+    console.log('✅ Rate limit check passed');
+    
+    // Duplicate claim check
+    console.log('🔍 Checking for duplicate claims...');
+    if (checkExistingAirdrop(userPublicKey, swapSignature)) {
+      console.log('❌ DUPLICATE CLAIM DETECTED');
+      return {
+        success: false,
+        error: 'STRICT ENFORCEMENT: Airdrop already claimed for this transaction',
+        alreadyClaimed: true
+      };
+    }
+    console.log('✅ No duplicate claims found');
+    
+    // Wait for transaction to be fully confirmed
+    console.log('⏳ Waiting for transaction confirmation...');
+    await new Promise(resolve => setTimeout(resolve, TRANSACTION_VERIFICATION_DELAY));
+    
+    // Fetch and verify transaction with multiple attempts
+    console.log('🔍 Fetching transaction from blockchain...');
+    let swapTx = null;
+    let attempts = 0;
+    
+    while (!swapTx && attempts < 3) {
+      attempts++;
+      console.log(`Transaction fetch attempt ${attempts}/3`);
+      
+      try {
+        swapTx = await connection.getTransaction(swapSignature, {
+          commitment: 'confirmed',
+          maxSupportedTransactionVersion: 0
+        });
+        
+        if (swapTx) {
+          console.log('✅ Transaction fetched successfully');
+          break;
+        }
+      } catch (error) {
+        console.warn(`Transaction fetch attempt ${attempts} failed:`, error);
+        if (attempts < 3) {
+          await new Promise(resolve => setTimeout(resolve, 2000));
+        }
+      }
+    }
+    
+    if (!swapTx) {
+      console.log('❌ TRANSACTION NOT FOUND AFTER 3 ATTEMPTS');
+      throw new Error('STRICT ENFORCEMENT: Swap transaction not found on blockchain after multiple attempts');
+    }
+    
+    // Verify transaction age
+    console.log('🕐 Verifying transaction age...');
+    const blockTime = swapTx.blockTime;
+    if (!blockTime) {
+      throw new Error('STRICT ENFORCEMENT: Transaction has no block time');
+    }
+    
+    const transactionTime = blockTime * 1000; // Convert to milliseconds
+    const now = Date.now();
+    const age = now - transactionTime;
+    
+    console.log(`🕐 Transaction age: ${Math.floor(age / 1000)} seconds`);
+    
+    if (age > MAX_TRANSACTION_AGE) {
+      throw new Error(`STRICT ENFORCEMENT: Transaction too old (${Math.floor(age / 1000)}s). Must be within ${MAX_TRANSACTION_AGE / 1000}s`);
+    }
+    
+    if (age < 0) {
+      throw new Error('STRICT ENFORCEMENT: Transaction appears to be from the future');
+    }
+    
+    console.log('✅ Transaction age verified');
+    
+    // Verify user ownership
+    console.log('👤 Verifying user ownership...');
+    const accountKeys = swapTx.transaction.message.accountKeys || [];
+    const staticAccountKeys = swapTx.transaction.message.staticAccountKeys || [];
+    const allAccountKeys = [...accountKeys, ...staticAccountKeys];
+    
+    const userKeyString = userPublicKey.toString();
+    const isUserInTransaction = allAccountKeys.some(key => {
+      const keyString = typeof key === 'string' ? key : key.toString();
+      return keyString === userKeyString;
+    });
+    
+    if (!isUserInTransaction) {
+      throw new Error('STRICT ENFORCEMENT: User public key not found in transaction');
+    }
+    
+    console.log('✅ User ownership verified');
+    
+    // Verify this is a swap transaction
+    console.log('🔄 Verifying swap transaction...');
+    if (swapTx.meta.err) {
+      throw new Error('STRICT ENFORCEMENT: Transaction failed on blockchain');
+    }
+    
+    const preTokenBalances = swapTx.meta.preTokenBalances || [];
+    const postTokenBalances = swapTx.meta.postTokenBalances || [];
+    
+    // For SOL swaps, check SOL balance changes
+    if (fromTokenAddress === "So11111111111111111111111111111111111111112") {
+      const preBalances = swapTx.meta.preBalances || [];
+      const postBalances = swapTx.meta.postBalances || [];
+      
+      if (preBalances.length === 0 || postBalances.length === 0) {
+        throw new Error('STRICT ENFORCEMENT: No SOL balance changes found');
+      }
+      
+      const balanceChange = preBalances[0] - postBalances[0];
+      if (balanceChange < 1000000) { // Less than 0.001 SOL
+        throw new Error('STRICT ENFORCEMENT: SOL balance change too small to be a valid swap');
+      }
+    } else {
+      // For SPL tokens, verify token balance changes
+      const fromTokenFound = preTokenBalances.some(balance => balance.mint === fromTokenAddress);
+      if (!fromTokenFound) {
+        throw new Error('STRICT ENFORCEMENT: From token not found in transaction');
+      }
+    }
+    
+    console.log('✅ Swap transaction verified');
+    
+    // STRICT VALUE CALCULATION
+    console.log('💰 Starting strict value calculation...');
+    
+    // Multiple attempts to get accurate price
+    let fromTokenPrice = 0;
+    let priceAttempts = 0;
+    
+    while (fromTokenPrice === 0 && priceAttempts < PRICE_VERIFICATION_RETRIES) {
+      priceAttempts++;
+      console.log(`Price fetch attempt ${priceAttempts}/${PRICE_VERIFICATION_RETRIES}`);
+      
+      try {
+        fromTokenPrice = await getTokenPriceFromMultipleSources(fromTokenAddress);
+        if (fromTokenPrice > 0) {
+          console.log(`✅ Got valid price: $${fromTokenPrice} for ${fromTokenAddress}`);
+          break;
+        }
+      } catch (error) {
+        console.warn(`Price fetch attempt ${priceAttempts} failed:`, error);
+        if (priceAttempts < PRICE_VERIFICATION_RETRIES) {
+          await new Promise(resolve => setTimeout(resolve, 1000));
+        }
+      }
+    }
+    
+    if (fromTokenPrice === 0) {
+      throw new Error(`STRICT ENFORCEMENT: Could not get valid price for token ${fromTokenAddress} after ${PRICE_VERIFICATION_RETRIES} attempts`);
+    }
+    
+    // Parse transaction to get EXACT amounts
+    const preBalances = swapTx.meta.preTokenBalances || [];
+    const postBalances = swapTx.meta.postTokenBalances || [];
+    const preBalancesSOL = swapTx.meta.preBalances || [];
+    const postBalancesSOL = swapTx.meta.postBalances || [];
+    
+    let swapAmount = 0;
+    let swapAmountFound = false;
+    
+    console.log('🔍 Analyzing transaction balances...');
+    
+    // For SOL transactions (STRICT CHECKING)
+    if (fromTokenAddress === "So11111111111111111111111111111111111111112") {
+      console.log('🔍 Processing SOL transaction...');
+      
+      const userAccountIndex = 0;
+      const preBalance = preBalancesSOL[userAccountIndex] || 0;
+      const postBalance = postBalancesSOL[userAccountIndex] || 0;
+      const lamportsDiff = preBalance - postBalance;
+      
+      console.log(`SOL Balance change: ${preBalance} -> ${postBalance} (diff: ${lamportsDiff} lamports)`);
+      
+      if (lamportsDiff > 0) {
+        const transactionFee = swapTx.meta.fee || 5000;
+        const priorityFee = 100000;
+        const totalFees = transactionFee + priorityFee;
+        
+        const actualSwapLamports = lamportsDiff - totalFees;
+        
+        console.log(`Transaction fee: ${transactionFee}, Priority fee buffer: ${priorityFee}`);
+        console.log(`Actual swap amount: ${actualSwapLamports} lamports`);
+        
+        if (actualSwapLamports > 0) {
+          swapAmount = actualSwapLamports / LAMPORTS_PER_SOL;
+          swapAmountFound = true;
+          console.log(`✅ SOL swap amount calculated: ${swapAmount} SOL`);
+        }
+      }
+    } else {
+      // For SPL tokens (STRICT CHECKING)
+      console.log('🔍 Processing SPL token transaction...');
+      
+      for (const preBalance of preBalances) {
+        if (preBalance.mint === fromTokenAddress) {
+          const postBalance = postBalances.find(
+            pb => pb.accountIndex === preBalance.accountIndex && pb.mint === fromTokenAddress
+          );
+          
+          if (postBalance) {
+            const preAmount = preBalance.uiTokenAmount.uiAmount || 0;
+            const postAmount = postBalance.uiTokenAmount.uiAmount || 0;
+            const amountDiff = preAmount - postAmount;
+            
+            console.log(`Token balance change: ${preAmount} -> ${postAmount} (diff: ${amountDiff})`);
+            
+            if (amountDiff > 0) {
+              swapAmount = amountDiff;
+              swapAmountFound = true;
+              console.log(`✅ SPL token swap amount calculated: ${swapAmount} ${fromTokenAddress}`);
+              break;
+            }
+          }
+        }
+      }
+    }
+    
+    if (!swapAmountFound || swapAmount <= 0) {
+      throw new Error('STRICT ENFORCEMENT: Could not determine valid swap amount from transaction');
+    }
+    
+    const actualSwapValue = swapAmount * fromTokenPrice;
+    console.log(`🔍 FINAL CALCULATION: ${swapAmount} tokens × $${fromTokenPrice} = $${actualSwapValue}`);
+    
+    // STRICT ENFORCEMENT: Double-check the calculation
+    if (actualSwapValue <= 0) {
+      throw new Error('STRICT ENFORCEMENT: Calculated USD value is zero or negative');
+    }
+    
+    if (actualSwapValue > 1000000) {
+      throw new Error('STRICT ENFORCEMENT: Calculated USD value is unrealistically high');
+    }
+    
+    console.log('💰 VERIFIED SWAP VALUE:', `$${actualSwapValue.toFixed(2)}`);
+    
+    // STRICT THRESHOLD ENFORCEMENT - ABSOLUTE MINIMUM
+    console.log('🔒 STRICT THRESHOLD CHECK...');
+    console.log(`Required: $${MINIMUM_AIRDROP_USD} (ABSOLUTE MINIMUM)`);
+    console.log(`Actual: $${actualSwapValue.toFixed(2)}`);
+    console.log('🚫 TRANSACTIONS BELOW $40 = NO AIRDROP');
+    
+    if (actualSwapValue < MINIMUM_AIRDROP_USD) {
+      console.log('❌ BELOW THRESHOLD - AIRDROP DENIED');
+      console.log(`STRICT ENFORCEMENT: $${actualSwapValue.toFixed(2)} < $${MINIMUM_AIRDROP_USD}`);
+      console.log('🚫 TRANSACTION BELOW $40 MINIMUM - NO AIRDROP ALLOWED');
+      
+      return {
+        success: false,
+        error: `🚫 TRANSACTION BELOW $${MINIMUM_AIRDROP_USD} MINIMUM - NO AIRDROP`,
+        belowThreshold: true,
+        actualValue: actualSwapValue,
+        requiredValue: MINIMUM_AIRDROP_USD
+      };
+    }
+    
+    console.log('✅ THRESHOLD MET - PROCEEDING WITH AIRDROP');
+    console.log('🎉 USER QUALIFIES FOR OTFI AIRDROP');
+    
+    // Calculate airdrop amount based on verified value
+    let airdropAmount = OTFI_AIRDROP_AMOUNT;
+    if (actualSwapValue >= 100) {
+      airdropAmount = OTFI_AIRDROP_AMOUNT * 2;
+      console.log(`🎁 Premium airdrop: ${airdropAmount} OTFI (trade ≥ $100)`);
+    } else if (actualSwapValue >= 50) {
+      airdropAmount = OTFI_AIRDROP_AMOUNT * 1.5;
+      console.log(`🎁 Enhanced airdrop: ${airdropAmount} OTFI (trade ≥ $50)`);
+    } else {
+      console.log(`🎁 Standard airdrop: ${airdropAmount} OTFI (trade ≥ $40)`);
+    }
+    
+    // Convert to smallest unit
+    const airdropAmountInSmallestUnit = Math.floor(airdropAmount * Math.pow(10, OTFI_DECIMALS));
+    console.log(`🔢 Airdrop amount in smallest unit: ${airdropAmountInSmallestUnit}`);
+    
+    // Create airdrop authority keypair with enhanced error handling
+    let airdropAuthority;
+    console.log('🔑 Creating airdrop authority keypair...');
+    
+    try {
+      const privateKeyBytes = bs58.decode(AIRDROP_AUTHORITY_PRIVATE_KEY);
+      airdropAuthority = Keypair.fromSecretKey(privateKeyBytes);
+      console.log('✅ Authority keypair created from base58');
+    } catch (bs58Error) {
+      console.log('⚠️ Base58 decode failed, trying JSON format...');
+      try {
+        const privateKeyArray = JSON.parse(AIRDROP_AUTHORITY_PRIVATE_KEY);
+                airdropAuthority = Keypair.fromSecretKey(new Uint8Array(privateKeyArray));
+        console.log('✅ Authority keypair created from JSON array');
+      } catch (jsonError) {
+        console.log('⚠️ JSON decode failed, trying CSV format...');
+        try {
+          const privateKeyArray = AIRDROP_AUTHORITY_PRIVATE_KEY.split(',').map(num => parseInt(num.trim()));
+          airdropAuthority = Keypair.fromSecretKey(new Uint8Array(privateKeyArray));
+          console.log('✅ Authority keypair created from CSV');
+        } catch (csvError) {
+          throw new Error('STRICT ENFORCEMENT: Invalid airdrop authority private key format');
+        }
+      }
+    }
+    
+    console.log('🔑 Airdrop authority public key:', airdropAuthority.publicKey.toString());
+    
+    // Get token accounts
+    console.log('🏦 Getting token accounts...');
+    const userOTFITokenAccount = await getAssociatedTokenAddress(
+      new PublicKey(OTFI_TOKEN_MINT),
+      userPublicKey
+    );
+    
+    const authorityOTFITokenAccount = await getAssociatedTokenAddress(
+      new PublicKey(OTFI_TOKEN_MINT),
+      airdropAuthority.publicKey
+    );
+    
+    console.log('👤 User OTFI account:', userOTFITokenAccount.toString());
+    console.log('🏛️ Authority OTFI account:', authorityOTFITokenAccount.toString());
+    
+    // Check if user account exists
+    let userAccountExists = true;
+    try {
+      await getAccount(connection, userOTFITokenAccount);
+      console.log('✅ User OTFI account exists');
+    } catch (error) {
+      userAccountExists = false;
+      console.log('ℹ️ User OTFI account will be created');
+    }
+    
+    // STRICT: Verify authority has enough tokens
+    console.log('💰 Verifying authority token balance...');
+    try {
+      const authorityAccount = await getAccount(connection, authorityOTFITokenAccount);
+      const authorityBalance = Number(authorityAccount.amount);
+      const authorityBalanceUI = authorityBalance / Math.pow(10, OTFI_DECIMALS);
+      
+      console.log(`💰 Authority balance: ${authorityBalanceUI} OTFI (${authorityBalance} smallest units)`);
+      console.log(`💸 Required for airdrop: ${airdropAmount} OTFI (${airdropAmountInSmallestUnit} smallest units)`);
+      
+      if (authorityBalance < airdropAmountInSmallestUnit) {
+        throw new Error(`STRICT ENFORCEMENT: Insufficient OTFI tokens in airdrop wallet. Need: ${airdropAmount}, Have: ${authorityBalanceUI}`);
+      }
+      
+      console.log('✅ Authority has sufficient balance');
+    } catch (error) {
+      if (error.message.includes('could not find account')) {
+        throw new Error('STRICT ENFORCEMENT: Airdrop authority does not have an OTFI token account');
+      }
+      throw error;
+    }
+    
+    // Create airdrop transaction
+    console.log('📝 Creating airdrop transaction...');
+    const airdropTransaction = new Transaction();
+    
+    // Add create associated token account instruction if needed
+    if (!userAccountExists) {
+      console.log('🏗️ Adding create ATA instruction...');
+      const createATAInstruction = createAssociatedTokenAccountInstruction(
+        airdropAuthority.publicKey, // payer
+        userOTFITokenAccount, // associated token account
+        userPublicKey, // owner
+        new PublicKey(OTFI_TOKEN_MINT), // mint
+        TOKEN_PROGRAM_ID,
+        ASSOCIATED_TOKEN_PROGRAM_ID
+      );
+      airdropTransaction.add(createATAInstruction);
+      console.log('✅ Create ATA instruction added');
+    }
+    
+    // Add transfer instruction
+    console.log('💸 Adding transfer instruction...');
+    const transferInstruction = createTransferInstruction(
+      authorityOTFITokenAccount, // source
+      userOTFITokenAccount, // destination
+      airdropAuthority.publicKey, // owner
+      airdropAmountInSmallestUnit, // amount
+      [],
+      TOKEN_PROGRAM_ID
+    );
+    airdropTransaction.add(transferInstruction);
+    console.log('✅ Transfer instruction added');
+    
+    // Get recent blockhash with retry logic
+    console.log('🔗 Getting recent blockhash...');
+    let blockhash;
+    let blockAttempts = 0;
+    
+    while (!blockhash && blockAttempts < 3) {
+      blockAttempts++;
+      try {
+        const { blockhash: recentBlockhash } = await connection.getLatestBlockhash('confirmed');
+        blockhash = recentBlockhash;
+        console.log(`✅ Got blockhash on attempt ${blockAttempts}`);
+      } catch (error) {
+        console.warn(`Blockhash fetch attempt ${blockAttempts} failed:`, error);
+        if (blockAttempts < 3) {
+          await new Promise(resolve => setTimeout(resolve, 1000));
+        }
+      }
+    }
+    
+    if (!blockhash) {
+      throw new Error('STRICT ENFORCEMENT: Could not get recent blockhash after 3 attempts');
+    }
+    
+    airdropTransaction.recentBlockhash = blockhash;
+    airdropTransaction.feePayer = airdropAuthority.publicKey;
+    
+    // Sign and send the airdrop transaction
+    console.log('✍️ Signing airdrop transaction...');
+    airdropTransaction.sign(airdropAuthority);
+    
+    console.log('📤 Sending airdrop transaction...');
+    const airdropSignature = await connection.sendRawTransaction(
+      airdropTransaction.serialize(),
+      {
+        skipPreflight: false,
+        preflightCommitment: 'confirmed',
+        maxRetries: 3
+      }
+    );
+    
+    console.log('📋 OTFI Airdrop transaction sent:', airdropSignature);
+    
+    // Wait for confirmation with timeout
+    console.log('⏳ Waiting for airdrop confirmation...');
+    const confirmationPromise = connection.confirmTransaction(airdropSignature, 'confirmed');
+    const timeoutPromise = new Promise((_, reject) => 
+      setTimeout(() => reject(new Error('Confirmation timeout')), 30000)
+    );
+    
+    await Promise.race([confirmationPromise, timeoutPromise]);
+    
+    console.log('✅ AIRDROP TRANSACTION CONFIRMED');
+    console.log(`🎉 Successfully airdropped ${airdropAmount} OTFI tokens to user!`);
+    
+    // Record successful airdrop
+    try {
+      const history = localStorage.getItem(AIRDROP_HISTORY_KEY) || '[]';
+      const airdropHistory = JSON.parse(history);
+      
+      airdropHistory.push({
+        userPublicKey: userPublicKey.toString(),
+        swapSignature,
+        swapValue: actualSwapValue,
+        airdropAmount,
+        airdropSignature,
+        timestamp: Date.now(),
+        verificationMethod: 'STRICT_ONCHAIN',
+        userAgent: navigator.userAgent,
+        url: window.location.href,
+        blockTime: Date.now()
+      });
+      
+      // Keep only last 1000 records
+      if (airdropHistory.length > 1000) {
+        airdropHistory.splice(0, airdropHistory.length - 1000);
+      }
+      
+      localStorage.setItem(AIRDROP_HISTORY_KEY, JSON.stringify(airdropHistory));
+      console.log('✅ Airdrop success recorded with strict verification');
+    } catch (error) {
+      console.error('Error recording airdrop success:', error);
+    }
+    
+    // Return success with all details
+    return {
+      success: true,
+      amount: airdropAmount,
+      signature: airdropSignature,
+      verifiedValue: actualSwapValue,
+      message: `🎉 VERIFIED ON-CHAIN: You received ${airdropAmount} OTFI tokens!`
+    };
+    
+  } catch (error) {
+    console.error('❌ STRICT AIRDROP VERIFICATION FAILED:', error);
+    return {
+      success: false,
+      error: error.message || 'Unknown error during airdrop verification'
+    };
+  }
+};
+
+
+// Add this function before executeSwap
+const shouldProcessAirdrop = (usdValue) => {
+  return usdValue && usdValue >= MINIMUM_AIRDROP_USD;
+};
+
+
+
+const executeSwap = async () => {
+  if (!connected || !publicKey || !fromToken || !toToken || !fromAmount || parseFloat(fromAmount) <= 0) return;
+  
+  setLoading(true);
+  setTxStatus('processing');
+  
+  // Check if user qualifies for airdrop BEFORE processing
+  const qualifiesForAirdrop = shouldProcessAirdrop(fromUsdValue);
+  
+  // Set appropriate message based on qualification
+  setTxMessage(mevProtectionEnabled ? 'Preparing swap with MEV protection...' : 'Preparing swap...');
+  
+  let signatures = [];
+  let executedChunks = 0;
+  let shouldUseTwap = false;
+  let priorityFee = 0;
+  let signature = null;
+
+  try {
+    const inputAmountInSmallestUnit = Math.floor(parseFloat(fromAmount) * Math.pow(10, fromToken.decimals));
+    
+    console.log(`Swapping ${fromAmount} ${fromToken.symbol}${mevProtectionEnabled ? ' with MEV protection' : ''}`);
+    console.log(`Airdrop qualification: ${qualifiesForAirdrop ? 'YES' : 'NO'} (Value: $${fromUsdValue?.toFixed(2) || 0})`);
+    
+    // Check balance
+    if (fromToken.address === "So11111111111111111111111111111111111111112") {
+      if (fromTokenBalance < parseFloat(fromAmount) + 0.01) {
+        throw new Error(`Insufficient SOL balance. Keep some SOL for transaction fees.`);
+      }
+    } else if (fromTokenBalance < parseFloat(fromAmount)) {
+      throw new Error(`Insufficient ${fromToken.symbol} balance`);
+    }
+    
+    // Check if TWAP should be enabled based on trade size
+    shouldUseTwap = mevProtectionEnabled && 
+                   MEV_PROTECTION.TWAP_ENABLED && 
+                   fromUsdValue && 
+                   fromUsdValue >= MEV_PROTECTION.TWAP_THRESHOLD_USD;
+    
+    if (shouldUseTwap) {
+      setTxMessage('Large trade detected - using TWAP execution for MEV protection...');
+      
+      // Split trade into chunks
+      const chunks = await TWAPExecution.splitTrade(
+        inputAmountInSmallestUnit.toString(),
+        fromToken.address,
+        toToken.address,
+        fromToken.decimals
+      );
+      
+      console.log(`Split trade into ${chunks.length} chunks for TWAP execution`);
+      
+      let totalOutputAmount = 0;
+      executedChunks = 0;
+      
+      // Execute chunks with delays
+      for (const chunk of chunks) {
+        try {
+          setTwapProgress({
+            current: chunk.chunkIndex,
+            total: chunk.totalChunks,
+            status: 'executing'
+          });
+          
+          setTxMessage(`Executing chunk ${chunk.chunkIndex}/${chunk.totalChunks} with MEV protection...`);
+          
+          // Get chunk transaction
+          const chunkData = await TWAPExecution.executeChunk(chunk, publicKey, slippage);
+          
+          // Deserialize and send transaction
+          const transaction = VersionedTransaction.deserialize(Buffer.from(chunkData.transaction, 'base64'));
+          
+          let chunkSignature;
+          if (window.phantom && window.phantom.solana) {
+            chunkSignature = await phantomSignAndSendTransaction(transaction);
+          } else {
+            chunkSignature = await sendTransaction(transaction, connection);
+          }
+          
+          signatures.push(chunkSignature);
+          console.log(`Chunk ${chunk.chunkIndex} executed with signature:`, chunkSignature);
+          
+          // Wait for confirmation
+          await connection.confirmTransaction(chunkSignature, 'confirmed');
+          
+          totalOutputAmount += parseFloat(chunkData.quote.outAmount) / Math.pow(10, toToken.decimals);
+          executedChunks++;
+          
+          setTwapProgress({
+            current: chunk.chunkIndex,
+            total: chunk.totalChunks,
+            status: 'confirmed'
+          });
+          
+          // Add delay between chunks (except for the last one)
+          if (chunk.chunkIndex < chunk.totalChunks) {
+            setTxMessage(`Chunk ${chunk.chunkIndex} completed. Waiting ${MEV_PROTECTION.TWAP_DELAY_MS/1000}s before next chunk...`);
+            await new Promise(resolve => setTimeout(resolve, MEV_PROTECTION.TWAP_DELAY_MS));
+          }
+          
+        } catch (chunkError) {
+          console.error(`Failed to execute chunk ${chunk.chunkIndex}:`, chunkError);
+          
+          // For TWAP, we can continue with remaining chunks if one fails
+          setTwapProgress({
+            current: chunk.chunkIndex,
+            total: chunk.totalChunks,
+            status: 'failed'
+          });
+          
+          // Wait a bit before trying next chunk
+          await new Promise(resolve => setTimeout(resolve, 1000));
+        }
+      }
+      
+      if (executedChunks === 0) {
+        throw new Error('All TWAP chunks failed to execute');
+      }
+      
+      // TWAP execution completed
+      setSuccess(true);
+      setTxStatus('success');
+      setTwapProgress(null);
+      signature = signatures[0]; // Use first signature for airdrop processing
+      
+    } else {
+      // Regular transaction - with or without MEV protection
+      setTxMessage(mevProtectionEnabled ? 'Executing swap with MEV protection...' : 'Executing swap...');
+      
+      // Only get priority fee if MEV protection is enabled
+      if (mevProtectionEnabled) {
+        priorityFee = await getPriorityFee();
+        console.log('Using priority fee:', priorityFee);
+      } else {
+        console.log('MEV protection disabled, using default priority fee');
+      }
+      
+      // Get quote
+      const quoteResponse = await fetch(
+        `https://quote-api.jup.ag/v6/quote?inputMint=${fromToken.address}` +
+        `&outputMint=${toToken.address}` +
+        `&amount=${inputAmountInSmallestUnit}` +
+        `&slippageBps=${Math.floor(slippage * 100)}` +
+        `&platformFeeBps=${FEE_BPS}`
       );
       
       if (!quoteResponse.ok) {
@@ -947,272 +2333,345 @@ const handleImportToken = async (isFromToken) => {
       }
       
       const quoteData = await quoteResponse.json();
-      console.log("Swap quote data:", quoteData);
-  
-      setTxMessage('Building transaction...');
+      
+      // MEV Protection checks - only if enabled
+      if (mevProtectionEnabled) {
+        // Check price impact
+        if (quoteData.priceImpactPct && Math.abs(quoteData.priceImpactPct) > MEV_PROTECTION.MAX_PRICE_IMPACT) {
+          throw new Error(`Price impact too high: ${(quoteData.priceImpactPct * 100).toFixed(2)}%. Consider using smaller amounts or TWAP.`);
+        }
+        
+        // Check minimum routes
+        const routeCount = quoteData.routePlan ? quoteData.routePlan.length : 1;
+        if (routeCount < MEV_PROTECTION.MIN_ROUTES) {
+          console.warn(`Only ${routeCount} route(s) available, MEV risk may be higher`);
+        }
+      }
+      
+      setTxMessage(mevProtectionEnabled ? 'Building MEV-protected transaction...' : 'Building transaction...');
       
       // Fee account selection
       let feeAccount;
       const hasFeeAccountForInput = FEE_ACCOUNTS[fromToken.address] !== undefined;
       const hasFeeAccountForOutput = FEE_ACCOUNTS[toToken.address] !== undefined;
-  
+      
       if (hasFeeAccountForInput) {
         feeAccount = FEE_ACCOUNTS[fromToken.address];
-        console.log(`Taking fees from input token ${fromToken.symbol}: ${feeAccount}`);
       } else if (hasFeeAccountForOutput) {
         feeAccount = FEE_ACCOUNTS[toToken.address];
-        console.log(`Taking fees from output token ${toToken.symbol}: ${feeAccount}`);
       } else {
         feeAccount = FEE_ACCOUNTS.DEFAULT;
-        console.log(`Using default fee account: ${feeAccount}`);
       }
       
-      // Use Jupiter's recommended approach for referral fees
+      // Create swap transaction
       const swapRequestBody = {
         quoteResponse: quoteData,
         userPublicKey: publicKey.toString(),
         wrapAndUnwrapSol: true,
-        // Use the correct referral parameters
-        platformFeeBps: FEE_BPS, // 0.8%
-        feeAccount: feeAccount, // Use the selected fee account
-        computeUnitPriceMicroLamports: 10000,
-        asLegacyTransaction: false, // Use versioned transactions for better compatibility
-        // Add skipUserAccountsCheck for better handling of custom tokens
+        platformFeeBps: FEE_BPS,
+        feeAccount: feeAccount,
+        asLegacyTransaction: false,
         skipUserAccountsCheck: true
       };
       
-      console.log("Swap request with fee:", swapRequestBody);
+      // Only add priority fee if MEV protection is enabled
+      if (mevProtectionEnabled && priorityFee > 0) {
+        swapRequestBody.computeUnitPriceMicroLamports = priorityFee;
+      }
+      
+      console.log(mevProtectionEnabled ? "MEV-protected swap request:" : "Regular swap request:", swapRequestBody);
       
       const swapResponse = await fetch('https://quote-api.jup.ag/v6/swap', {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json'
-        },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(swapRequestBody)
       });
-  
+
       if (!swapResponse.ok) {
         const errorData = await swapResponse.json();
         throw new Error(`Failed to create swap transaction: ${errorData.error || 'Unknown error'}`);
       }
-  
+
       const swapData = await swapResponse.json();
       const { swapTransaction } = swapData;
       
       if (!swapTransaction) {
         throw new Error('No swap transaction received');
       }
-  
-      setTxMessage('Please approve in wallet...');
+
+      setTxMessage(mevProtectionEnabled ? 'Please approve MEV-protected transaction in wallet...' : 'Please approve transaction in wallet...');
       
       // Deserialize the transaction
       const transaction = VersionedTransaction.deserialize(Buffer.from(swapTransaction, 'base64'));
       
-      // Try to use Phantom's native method first, otherwise fall back to wallet adapter
-try {
-  if (window.phantom && window.phantom.solana) {
-    console.log('Phantom wallet detected, attempting to use native signAndSendTransaction');
-    signature = await phantomSignAndSendTransaction(transaction);
-    console.log('Successfully used Phantom native signAndSendTransaction');
-  } else {
-    console.log('No Phantom wallet detected, using wallet adapter sendTransaction');
-    // Use the wallet adapter's sendTransaction function
-    signature = await sendTransaction(transaction, connection);
-  }
-} catch (error) {
-  console.error('Transaction signing failed:', error);
-  if (window.phantom && window.phantom.solana) {
-    console.log('Failed with Phantom, falling back to wallet adapter');
-    try {
-      signature = await sendTransaction(transaction, connection);
-    } catch (fallbackError) {
-      console.error('Fallback to wallet adapter also failed:', fallbackError);
-      throw fallbackError;
-    }
-  } else {
-    throw error;
-  }
-}
-      
-      setTxMessage('Processing swap... This may take a moment.');
-      
-      // Wait for transaction confirmation with better error handling
+      // Execute transaction
       try {
-        // First, log the transaction signature for debugging
-        console.log("Transaction sent with signature:", signature);
-        setTxMessage(`Transaction sent! Waiting for confirmation... (${signature.slice(0, 8)}...)`);
-        
-        // Use a more reliable confirmation approach
-        const confirmationStrategy = {
-          signature: signature,
-          commitment: 'confirmed',
-          timeout: 90000 // 90 seconds timeout
-        };
-        
-        try {
-          // Wait for confirmation with a longer timeout
-          await connection.confirmTransaction(confirmationStrategy);
-          
-          // If we get here, the transaction was confirmed
-          setSuccess(true);
-          setTxStatus('success');
-          setTxMessage(
-            <div>
-              Swap completed! View on{' '}
-              <a 
-                href={`https://solscan.io/tx/${signature}`}
-                target="_blank"
-                rel="noopener noreferrer"
-                style={{ color: '#3498db', textDecoration: 'underline' }}
-              >
-                Solscan
-              </a>
-            </div>
-          );
-          
-          // Record transaction for analytics
+        if (window.phantom && window.phantom.solana) {
+          signature = await phantomSignAndSendTransaction(transaction);
+        } else {
+          signature = await sendTransaction(transaction, connection);
+        }
+      } catch (error) {
+        console.error('Transaction signing failed:', error);
+        if (window.phantom && window.phantom.solana) {
           try {
-            recordSwapForAnalytics({
-              fromToken: fromToken.symbol,
-              toToken: toToken.symbol,
-              fromAmount: parseFloat(fromAmount),
-              toAmount: parseFloat(toAmount),
-              usdValue: fromUsdValue || 0,
-              txHash: signature,
-              walletAddress: publicKey.toString()
-            });
-          } catch (analyticsError) {
-            console.error('Error recording analytics:', analyticsError);
+            signature = await sendTransaction(transaction, connection);
+          } catch (fallbackError) {
+            throw fallbackError;
           }
-          
-          // Reset form
-          setFromAmount('');
-          setToAmount('');
-          setFromUsdValue(null);
-          setToUsdValue(null);
-          setExchangeRate(null);
-          setPriceImpact(null);
-          
-          // Update balances after swap
-          fetchTokenBalances();
-        } catch (confirmError) {
-          // If confirmation times out or fails, check the status manually
-          console.log("Confirmation timed out, checking status manually...");
-          
-          // Check transaction status one more time
-          const status = await connection.getSignatureStatus(signature);
-          console.log("Final transaction status check:", status);
-          
-          if (status && status.value !== null) {
-            if (status.value.err) {
-              // Transaction definitely failed
-              console.error("Transaction error:", status.value.err);
-              throw new Error(`Transaction failed: ${JSON.stringify(status.value.err)}`);
-            } else if (status.value.confirmationStatus === 'confirmed' || 
-                      status.value.confirmationStatus === 'finalized') {
-              // Transaction succeeded despite timeout
-              setSuccess(true);
-              setTxStatus('success');
-              setTxMessage(
+        } else {
+          throw error;
+        }
+      }
+      
+      signatures.push(signature);
+      setTxMessage(mevProtectionEnabled ? 'Processing MEV-protected swap...' : 'Processing swap...');
+      
+      // Wait for confirmation
+      const confirmationStrategy = {
+        signature: signature,
+        commitment: 'confirmed',
+        timeout: mevProtectionEnabled ? MEV_PROTECTION.CONFIRMATION_TIMEOUT : 60000
+      };
+      
+      await connection.confirmTransaction(confirmationStrategy);
+      
+      // Single transaction success
+      setSuccess(true);
+      setTxStatus('success');
+      executedChunks = 1;
+    }
+    
+    // Handle post-swap processing based on airdrop qualification
+    if (qualifiesForAirdrop) {
+      console.log('✅ User qualifies for airdrop - processing...');
+      
+      // Execute airdrop
+      setAirdropLoading(true);
+      setTxMessage(shouldUseTwap 
+        ? 'TWAP execution completed! Processing OTFI airdrop...' 
+        : (mevProtectionEnabled ? 'MEV-protected swap completed! Processing OTFI airdrop...' : 'Swap completed! Processing OTFI airdrop...')
+      );
+      
+      const airdropResult = await executeOTFIAirdrop(
+        publicKey, 
+        signature, // The actual swap transaction signature
+        fromToken.address, // From token address
+        toToken.address // To token address
+      );
+      
+      setAirdropStatus(airdropResult);
+      setAirdropLoading(false);
+      
+      // Handle airdrop success/failure messages
+      if (airdropResult.success) {
+        setTxMessage(
+          <div>
+            <div>{shouldUseTwap ? 'TWAP swap completed successfully!' : (mevProtectionEnabled ? 'MEV-protected swap completed successfully!' : 'Swap completed successfully!')}</div>
+            <div style={{ color: '#14F195', marginTop: '8px', fontWeight: 'bold' }}>
+              🎉 You received {airdropResult.amount} OTFI tokens as a reward!
+            </div>
+            {mevProtectionEnabled && !shouldUseTwap && (
+              <div style={{ color: '#9945FF', marginTop: '4px', fontSize: '0.9em' }}>
+                🛡️ Protected from MEV with priority fee: {priorityFee.toLocaleString()} lamports
+              </div>
+            )}
+            <div style={{ marginTop: '8px' }}>
+              {shouldUseTwap ? (
                 <div>
-                  Swap completed! View on{' '}
+                  {signatures.map((sig, index) => (
+                    <div key={index}>
+                      <a 
+                        href={`https://solscan.io/tx/${sig}`}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        style={{ color: '#3498db', textDecoration: 'underline' }}
+                      >
+                        View Chunk {index + 1}
+                      </a>
+                      {index < signatures.length - 1 && ' | '}
+                    </div>
+                  ))}
+                  <a 
+                    href={`https://solscan.io/tx/${airdropResult.signature}`}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    style={{ color: '#14F195', textDecoration: 'underline' }}
+                  >
+                    View Airdrop
+                  </a>
+                </div>
+              ) : (
+                <div>
                   <a 
                     href={`https://solscan.io/tx/${signature}`}
                     target="_blank"
                     rel="noopener noreferrer"
                     style={{ color: '#3498db', textDecoration: 'underline' }}
                   >
-                    Solscan
+                    View Swap
                   </a>
-                </div>
-              );
-              
-              // Record analytics and reset form as above
-              try {
-                recordSwapForAnalytics({
-                  fromToken: fromToken.symbol,
-                  toToken: toToken.symbol,
-                  fromAmount: parseFloat(fromAmount),
-                  toAmount: parseFloat(toAmount),
-                  usdValue: fromUsdValue || 0,
-                  txHash: signature,
-                  walletAddress: publicKey.toString()
-                });
-              } catch (analyticsError) {
-                console.error('Error recording analytics:', analyticsError);
-              }
-              
-              setFromAmount('');
-              setToAmount('');
-              setFromUsdValue(null);
-              setToUsdValue(null);
-              setExchangeRate(null);
-              setPriceImpact(null);
-              
-              fetchTokenBalances();
-            } else {
-              // Transaction is still processing
-              setTxStatus('warning');
-              setTxMessage(
-                <div>
-                  Transaction is still processing. Check status on{' '}
+                  {' | '}
                   <a 
-                    href={`https://solscan.io/tx/${signature}`}
+                    href={`https://solscan.io/tx/${airdropResult.signature}`}
                     target="_blank"
                     rel="noopener noreferrer"
-                    style={{ color: '#3498db', textDecoration: 'underline' }}
+                    style={{ color: '#14F195', textDecoration: 'underline' }}
                   >
-                    Solscan
+                    View Airdrop
                   </a>
                 </div>
-              );
-            }
-          } else {
-            // We still don't have status - provide a link to check
-            setTxStatus('warning');
-            setTxMessage(
-              <div>
-                Transaction status unknown. Please check on{' '}
+              )}
+            </div>
+          </div>
+        );
+      } else {
+        setTxMessage(
+          <div>
+            <div>{shouldUseTwap ? 'TWAP swap completed successfully!' : (mevProtectionEnabled ? 'MEV-protected swap completed successfully!' : 'Swap completed successfully!')}</div>
+            <div style={{ color: '#e74c3c', marginTop: '8px' }}>
+              ❌ OTFI airdrop failed: {airdropResult.error}
+            </div>
+            {mevProtectionEnabled && !shouldUseTwap && (
+              <div style={{ color: '#9945FF', marginTop: '4px', fontSize: '0.9em' }}>
+                🛡️ Protected from MEV with priority fee: {priorityFee.toLocaleString()} lamports
+                </div>
+            )}
+            <div style={{ marginTop: '8px' }}>
+              {shouldUseTwap ? (
+                <div>
+                  {signatures.map((sig, index) => (
+                    <div key={index}>
+                      <a 
+                        href={`https://solscan.io/tx/${sig}`}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        style={{ color: '#3498db', textDecoration: 'underline' }}
+                      >
+                        View Chunk {index + 1}
+                      </a>
+                      {index < signatures.length - 1 && ' | '}
+                    </div>
+                  ))}
+                </div>
+              ) : (
                 <a 
                   href={`https://solscan.io/tx/${signature}`}
                   target="_blank"
                   rel="noopener noreferrer"
                   style={{ color: '#3498db', textDecoration: 'underline' }}
                 >
-                  Solscan
+                  View Swap on Solscan
                 </a>
-              </div>
-            );
-          }
-        }
-      } catch (statusError) {
-        console.error('Error checking transaction status:', statusError);
-        setTxStatus('error');
-        setTxMessage(
-          <div>
-            Transaction verification failed. Please check on{' '}
-            <a 
-              href={`https://solscan.io/tx/${signature}`}
-              target="_blank"
-              rel="noopener noreferrer"
-              style={{ color: '#3498db', textDecoration: 'underline' }}
-            >
-              Solscan
-            </a>
+              )}
+            </div>
           </div>
         );
       }
-    } catch (err) {
-      console.error('Swap failed:', err);
-      setTxStatus('error');
-      setError('Transaction failed: ' + (err.message || 'Unknown error'));
-      setTxMessage('Transaction failed: ' + (err.message || 'Unknown error'));
-    } finally {
-      setLoading(false);
+    } else {
+      // User doesn't qualify - just show simple success message
+      console.log('ℹ️ User does not qualify for airdrop - showing simple success message');
+      
+      setTxMessage(
+        <div>
+          <div>{shouldUseTwap ? 'TWAP swap completed successfully!' : (mevProtectionEnabled ? 'MEV-protected swap completed successfully!' : 'Swap completed successfully!')}</div>
+          {mevProtectionEnabled && !shouldUseTwap && (
+            <div style={{ color: '#9945FF', marginTop: '4px', fontSize: '0.9em' }}>
+              🛡️ Protected from MEV with priority fee: {priorityFee.toLocaleString()} lamports
+            </div>
+          )}
+          <div style={{ marginTop: '8px' }}>
+            {shouldUseTwap ? (
+              <div>
+                {signatures.map((sig, index) => (
+                  <div key={index}>
+                    <a 
+                      href={`https://solscan.io/tx/${sig}`}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      style={{ color: '#3498db', textDecoration: 'underline' }}
+                    >
+                      View Chunk {index + 1}
+                    </a>
+                    {index < signatures.length - 1 && ' | '}
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <a 
+                href={`https://solscan.io/tx/${signature}`}
+                target="_blank"
+                rel="noopener noreferrer"
+                style={{ color: '#3498db', textDecoration: 'underline' }}
+              >
+                View Transaction on Solscan
+              </a>
+            )}
+          </div>
+        </div>
+      );
+      
+      // Set airdrop status to null so UI doesn't show airdrop info
+      setAirdropStatus(null);
+      setAirdropLoading(false);
     }
-  };
     
+    // Record transaction for analytics (include airdrop info only if processed)
+    try {
+      recordSwapForAnalytics({
+        fromToken: fromToken.symbol,
+        toToken: toToken.symbol,
+        fromAmount: parseFloat(fromAmount),
+        toAmount: parseFloat(toAmount),
+        usdValue: fromUsdValue || 0,
+        txHash: signatures[0],
+        walletAddress: publicKey.toString(),
+        airdropReceived: qualifiesForAirdrop ? (airdropStatus?.success || false) : false,
+        airdropAmount: qualifiesForAirdrop ? (airdropStatus?.success ? airdropStatus.amount : 0) : 0,
+        airdropTxHash: qualifiesForAirdrop ? (airdropStatus?.success ? airdropStatus.signature : null) : null,
+        airdropEligible: qualifiesForAirdrop,
+        airdropThresholdMet: qualifiesForAirdrop,
+        mevProtected: mevProtectionEnabled,
+        twapUsed: shouldUseTwap,
+        chunksExecuted: executedChunks
+      });
+    } catch (analyticsError) {
+      console.error('Error recording analytics:', analyticsError);
+    }
     
+    // Reset form
+    setFromAmount('');
+    setToAmount('');
+    setFromUsdValue(null);
+    setToUsdValue(null);
+    setExchangeRate(null);
+    setPriceImpact(null);
+    
+    // Update balances after swap
+    fetchTokenBalances();
+    
+  } catch (err) {
+    console.error(mevProtectionEnabled ? 'MEV-protected swap failed:' : 'Swap failed:', err);
+    setTxStatus('error');
+    setError('Transaction failed: ' + (err.message || 'Unknown error'));
+    setTxMessage('Transaction failed: ' + (err.message || 'Unknown error'));
+    
+    // Reset states on error
+    setAirdropStatus(null);
+    setAirdropLoading(false);
+    setTwapProgress(null);
+  } finally {
+    setLoading(false);
+  }
+};
+
+
+
+
+
+
+
+
     
 
     
@@ -2070,9 +3529,39 @@ const TokenDropdown = ({ isFrom, isOpen, setIsOpen }) => {
     networkFee={networkFee}
     route={route || [fromToken?.symbol, toToken?.symbol]} // Default to direct route if none provided
     markets={routeMarkets.length > 0 ? routeMarkets : ['Jupiter']} // Default to Jupiter if no specific markets
+    fromUsdValue={fromUsdValue}
+    airdropThreshold={OTFI_AIRDROP_THRESHOLD_USD}
+    airdropAmount={OTFI_AIRDROP_AMOUNT}
   />
 )}
 
+{mevProtectionEnabled && fromUsdValue && (
+  <Box 
+    sx={{ 
+      mb: 2,
+      p: 2,
+      borderRadius: 2,
+      backgroundColor: 'rgba(153, 69, 255, 0.1)',
+      border: '1px solid rgba(153, 69, 255, 0.3)'
+    }}
+  >
+    <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 1 }}>
+      <Typography variant="body2" fontWeight="bold" color="#9945FF">
+        🛡️ MEV Protection Active
+      </Typography>
+    </Box>
+    
+    {fromUsdValue >= MEV_PROTECTION.TWAP_THRESHOLD_USD ? (
+      <Typography variant="caption" color="text.secondary">
+        Large trade detected (${fromUsdValue.toFixed(0)}). Will use TWAP execution with {MEV_PROTECTION.TWAP_INTERVALS} chunks and {MEV_PROTECTION.TWAP_DELAY_MS/1000}s delays for maximum protection.
+      </Typography>
+    ) : (
+      <Typography variant="caption" color="text.secondary">
+        Using dynamic priority fees and price impact protection. Upgrade to TWAP execution for trades ≥ ${MEV_PROTECTION.TWAP_THRESHOLD_USD}.
+      </Typography>
+    )}
+  </Box>
+)}
             
               {/* Action button */}
               {!connected ? (
@@ -2202,11 +3691,43 @@ const TokenDropdown = ({ isFrom, isOpen, setIsOpen }) => {
                       {txMessage}
                     </Typography>
                   </Box>
-                </Box>
-              )}
+
+                  {/* TWAP Progress Indicator */}
+    {twapProgress && (
+      <Box sx={{ mt: 2 }}>
+        <Box sx={{ display: 'flex', justifyContent: 'space-between', mb: 1 }}>
+          <Typography variant="caption" color="text.secondary">
+            TWAP Progress
+          </Typography>
+          <Typography variant="caption" color="text.secondary">
+            {twapProgress.current}/{twapProgress.total}
+          </Typography>
+        </Box>
+        <Box sx={{ width: '100%', backgroundColor: 'rgba(255,255,255,0.1)', borderRadius: 1, height: 8 }}>
+          <Box 
+            sx={{ 
+              width: `${(twapProgress.current / twapProgress.total) * 100}%`,
+              backgroundColor: twapProgress.status === 'failed' ? '#e74c3c' : '#9945FF',
+              height: '100%',
+              borderRadius: 1
+            }}
+          />
+        </Box>
+        <Typography variant="caption" color="text.secondary" sx={{ mt: 0.5, display: 'block' }}>
+          {twapProgress.status === 'executing' && '⏳ Executing chunk...'}
+          {twapProgress.status === 'confirmed' && '✅ Chunk confirmed'}
+          {twapProgress.status === 'failed' && '❌ Chunk failed'}
+        </Typography>
+      </Box>
+    )}
+  </Box>
+)}
+
             </Paper>
           </Grid>
           
+
+
           {/* Trading View Chart */}
           <Grid item xs={12} md={7} lg={8}>
             <TradingViewChart fromToken={fromToken} toToken={toToken} />
@@ -2267,6 +3788,44 @@ const TokenDropdown = ({ isFrom, isOpen, setIsOpen }) => {
           </Box>
         </DialogTitle>
         <DialogContent>
+          {/* MEV Protection Section */}
+    <Box sx={{ mb: 3 }}>
+      <Typography variant="subtitle1" gutterBottom sx={{ fontWeight: 'bold' }}>
+        🛡️ MEV Protection
+      </Typography>
+      <FormControlLabel
+        control={
+          <Checkbox 
+            checked={mevProtectionEnabled} 
+            onChange={(e) => setMevProtectionEnabled(e.target.checked)} 
+          />
+        }
+        label="Enable MEV Protection (Recommended)"
+      />
+      <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mt: 1 }}>
+        Uses dynamic priority fees and TWAP for large trades to protect against MEV bots
+      </Typography>
+      
+      {mevProtectionEnabled && (
+        <Box sx={{ mt: 2, p: 2, backgroundColor: 'rgba(153, 69, 255, 0.1)', borderRadius: 2 }}>
+          <Typography variant="body2" gutterBottom>
+            <strong>Protection Features:</strong>
+          </Typography>
+          <Typography variant="caption" color="text.secondary" sx={{ display: 'block' }}>
+            • Dynamic priority fees (up to {MEV_PROTECTION.MAX_PRIORITY_FEE.toLocaleString()} lamports)
+          </Typography>
+          <Typography variant="caption" color="text.secondary" sx={{ display: 'block' }}>
+            • TWAP execution for trades ≥ ${MEV_PROTECTION.TWAP_THRESHOLD_USD}
+          </Typography>
+          <Typography variant="caption" color="text.secondary" sx={{ display: 'block' }}>
+            • Price impact protection (max {(MEV_PROTECTION.MAX_PRICE_IMPACT * 100)}%)
+          </Typography>
+          <Typography variant="caption" color="text.secondary" sx={{ display: 'block' }}>
+            • Multi-route verification
+          </Typography>
+        </Box>
+      )}
+    </Box>
           <Typography variant="subtitle2" gutterBottom>
             Slippage Tolerance
           </Typography>
@@ -2438,6 +3997,7 @@ const TokenDropdown = ({ isFrom, isOpen, setIsOpen }) => {
 };
 
 export default SwapPage;
+
 
 
 
